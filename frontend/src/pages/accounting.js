@@ -1,0 +1,37 @@
+import {domain} from '../constants/domain.js';import {session} from '../stores/session.js';import {accountingApi} from '../api/research.js';import {table} from '../components/common/table.js';import {bars} from '../components/common/chart.js';import {esc,formObject,localTime,fmt} from '../utils/format.js';import {action,toast,bind} from '../hooks/actions.js';
+
+const pct=value=>(Number(value||0)*100).toFixed(1)+'%';
+const when=value=>{try{return localTime(value)}catch{return esc(value||'')}};
+let selectedVersion=null;
+
+export async function accountingPage(){
+  const [status,events,versions]=await Promise.all([accountingApi.status(),accountingApi.events(),accountingApi.versions()]);
+  const terminals=status.terminals||[];
+  const pending=status.pending_ratings||[];
+  const coverage=status.coverage||[];
+  const choices=versions.map(v=>v.id);
+  const picked=selectedVersion&&choices.includes(selectedVersion)?selectedVersion:choices[0];
+  const current=picked?await accountingApi.version(picked):null;
+  const coverageRows=(current?current.coverage:coverage).map(r=>({...r,ratio:r.ratio,ratioLabel:pct(r.ratio)}));
+  const slotCells=terminals.map(t=>'<article class="terminal-record"><header><b>'+esc(t.code)+'</b><small>'+esc(t.venue)+'</small></header><p class="fine">申报时段 '+t.declared_slots.join(' / ')+' · 已收 '+t.received_slots.join(' / ')+'</p><div class="slot-strip">'+t.declared_slots.map(s=>'<span class="'+(t.missing_slots.includes(s)?'slot missing':'slot received')+'">'+s+'</span>').join('')+'</div>'+(t.missing_slots.length?'<small>缺 '+t.missing_slots.join(',')+' · 暂不封账</small>':'<small>时段已收齐</small>')+'</article>').join('');
+  return '<section class="page-heading"><p class="eyebrow">03 / OFFLINE RECONCILE</p><h1>评分与曝光，按发生时间对上。</h1><p>断网补传时事件可能乱序到达：评分归给同场、同访客、同展品最近一次此前曝光；找不到先挂起，迟到的曝光会重新改变归属。每台终端申报的时段序号全部收到后才允许封账。</p></section>'+
+  '<dl class="metrics metrics-5">'+[[ '终端', terminals.length],['已收事件',status.summary.events],['评分已配对',status.summary.matched],['挂起评分',status.summary.pending],['曝光覆盖率',pct(status.summary.coverage_ratio)]].map(([label,value])=>'<div><dt>'+esc(label)+'</dt><dd>'+fmt(value)+'</dd></div>').join('')+'</dl>'+
+  '<div class="split"><section><h2>终端与时段 <small>收齐每台终端申报的全部时段序号后封账</small></h2><div class="terminal-grid">'+(slotCells||'<div class="empty">还没有登记终端。先登记终端及它申报的时段序号。</div>')+'</div>'+
+  '<h2>收录事件 <small>首次收录版本唯一，重试与重复补传不重复计入</small></h2>'+table(events.map(e=>({...e,occurred_at:when(e.occurred_at),state:e.kind==='rating'?(e.match_status==='matched'?'已配对':'挂起'):(e.rated?'被评分':'未评分'),first_version:e.first_version??'未封账'})),[ {key:'record_uid',label:'记录编号'},{key:'terminal',label:'终端'},{key:'kind',label:'类型'},{key:'visitor',label:'匿名访客'},{key:'exhibit',label:'展品'},{key:'occurred_at',label:'发生时间'},{key:'slot',label:'时段'},{key:'rating',label:'评分'},{key:'state',label:'配对状态'},{key:'first_version',label:'首次收录版本'}],{limit:50})+
+  '<h2>当前挂起评分 <small>等待迟到的更早曝光</small></h2>'+table(pending.map(p=>({...p,occurred_at:when(p.occurred_at),received_at:when(p.received_at)})),[{key:'record_uid',label:'记录编号'},{key:'terminal',label:'终端'},{key:'visitor',label:'匿名访客'},{key:'exhibit',label:'展品'},{key:'occurred_at',label:'评分发生时间'},{key:'slot',label:'时段'},{key:'rating',label:'评分'}],{limit:30})+
+  '<h2>版本账册 <small>封账后补件另出新版，旧版按当时收件复算</small></h2>'+(versions.length?'<label class="compact">查看版本<select id="version-select">'+versions.map(v=>'<option value="'+v.id+'" '+(current&&v.id===current.id?'selected':'')+'>版本 #'+v.version_no+' · '+esc(when(v.closed_at))+'</option>').join('')+'</select></label>':'')+table(versions.map(v=>({...v,closed_at:when(v.closed_at),first_included:v.first_included_event_ids.length,exposures:v.summary?.exposures,rated:v.summary?.rated_exposures,coverage:pct(v.summary?.coverage_ratio)})),[{key:'version_no',label:'版本'},{key:'closed_at',label:'封账时间'},{key:'closed_by',label:'封账人'},{key:'first_included',label:'首次收录条数'},{key:'exposures',label:'曝光'},{key:'rated',label:'有评分曝光'},{key:'coverage',label:'曝光覆盖率'},{key:'checksum',label:'校验和'}],{limit:20})+(
+  current?'<h2>版本 #'+current.version_no+' · 各展品有评分的曝光占比</h2><p class="fine">按该版本封账时收件快照计算；'+ (current.verified?'快照校验通过':'快照校验不一致，请复核') +' · 包含 '+current.first_included_event_ids.length+' 条首次收录记录 · 校验和 <code>'+esc(current.checksum)+'</code></p>'+table(coverageRows,[{key:'exhibit',label:'展品'},{key:'exposures',label:'曝光数'},{key:'rated_exposures',label:'有评分曝光'},{key:'ratioLabel',label:'有评分曝光占比'}],{limit:30})+'<h3>各展品曝光覆盖率</h3>'+bars(coverageRows.map(r=>({label:r.exhibit+' · '+r.ratioLabel,value:Number(r.ratio||0)}))):'<p class="empty">还没有封账版本。收齐各终端申报时段后封账，即可按版本查看曝光覆盖率。</p>')+
+  '</section><aside class="entry-sheet">'+
+  (session.writable?(terminals.length?'<h2>申报事件</h2><form id="event-form"><label>终端<select name="terminal_id">'+terminals.map(t=>'<option value="'+t.id+'">'+esc(t.code)+' · '+esc(t.venue)+'</option>').join('')+'</select></label><div class="event-row"><label>记录编号<input name="record_uid" required placeholder="T1-EXP-0001"></label><label>类型<select name="kind"><option value="exposure">曝光</option><option value="rating">评分</option></select></label></div><div class="event-row"><label>匿名访客<input name="visitor" required value="V-NEW"></label><label>展品代号<input name="exhibit" required value="E01"></label></div><div class="event-row"><label>发生时间<input name="occurred_at" required placeholder="2026-11-18T09:50:00+08:00"></label><label>时段序号<input name="slot" type="number" min="1" step="1" required value="1"></label></div><label>评分 1–5（仅评分记录）<input name="rating" type="number" min="1" max="5" step="any"></label><button type="submit">提交补传记录 →</button></form>':'<div class="empty">先登记终端并申报时段，才能接收补传记录。</div>')+
+  '<form id="terminal-form"><h2>登记终端</h2><label>终端编号<input name="code" required placeholder="T2"></label><label>场地<input name="venue" required placeholder="HALL-A"></label><label>终端名称<input name="name" placeholder="入口闸机"></label><label>申报时段序号（逗号分隔）<input name="declared_slots" required placeholder="1,2,3"></label><button type="submit">登记并申报时段</button></form>'+
+  '<form id="close-form"><h2>封账</h2><p class="fine">'+(status.can_close?'全部终端时段已收齐，可封出新版本。':status.all_slots_received?'没有新的收录记录可封账。':'仍有终端时段未收齐，封账会被拒绝。')+'</p><button type="submit" '+(status.can_close?'':'disabled')+'>收齐后封账 →</button></form>':'<h2>阅读权限</h2><p>阅读者可查看事件、挂起项和版本覆盖率；申报与封账由分析师或负责人执行。</p>')+
+  '<div class="method-note"><b>配对规则</b><p>同场 + 同匿名访客 + 同展品，取发生时间不晚于评分的最近一次曝光。曝光迟到时按最新收件重算归属，先前挂起的评分可自动配对；已封账版本仍按封账时收件快照复算。</p></div>'+
+  '</aside></div>';
+}
+
+export function bindAccounting(refresh){
+  bind('#version-select','change',async e=>{selectedVersion=Number(e.target.value);await refresh()});
+  action('#event-form',async form=>{const data=formObject(form),event={record_uid:data.record_uid,kind:data.kind,visitor:data.visitor,exhibit:data.exhibit,occurred_at:data.occurred_at,slot:Number(data.slot)};if(data.rating!==''&&data.rating!=null)event.rating=Number(data.rating);const r=await accountingApi.addEvents(Number(data.terminal_id),[event]);await refresh();toast(r.accepted?'已收录 1 条':'未新增：'+(r.duplicates?'重复记录按首次收件保留':'记录冲突，保留首次收件版本'))});
+  action('#terminal-form',async form=>{const data=formObject(form);const slots=String(data.declared_slots).split(',').map(x=>Number(x.trim())).filter(x=>Number.isInteger(x)&&x>0);await accountingApi.createTerminal({code:data.code,venue:data.venue,name:data.name,declared_slots:slots});await refresh();toast('终端已登记')});
+  action('#close-form',async()=>{const r=await accountingApi.close();await refresh();toast('已封账为版本 #'+r.version_no)})
+}

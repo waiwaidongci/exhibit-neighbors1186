@@ -1,3 +1,6 @@
 -- SQLAlchemy metadata initializes tables idempotently.
 -- Domain tables: exhibitions, visitor_ratings, recommendation_runs, curator_selections.
 -- Unique natural keys: source.key; (record.source_id, record.reference).
+-- Offline intake ledger: terminals, terminal_events (unique terminal_id + record_uid),
+-- account_versions, account_version_events (event_id is the primary key so a record
+-- can only be first-included in one version), and the account_lock singleton row.

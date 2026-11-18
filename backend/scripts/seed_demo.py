@@ -1,4 +1,5 @@
 import json,random,logging
+from datetime import datetime,timedelta,timezone
 from sqlalchemy import select,func
 from src.config.database import Base,engine,Session
 from src.config.settings import CONFIG
@@ -7,9 +8,12 @@ from src.models.source import Source
 from src.models.record import Record
 from src.models.run import Run
 from src.models import note,audit
+from src.models import accounting as accounting_models
+from src.schemas.accounting import EventBatch,EventInput,TerminalInput
 from src.utils.security import hash_password
 from src.utils.serialization import now
 from src.services.runs import queue
+from src.services.accounting import close_books,add_events,create_terminal
 from src.services.domain_validation import validate_record
 
 def seed_values(kind,index,batch,rng):
@@ -32,6 +36,42 @@ def seed_values(kind,index,batch,rng):
 
 def counts(db):
     return {cls.__tablename__:db.scalar(select(func.count()).select_from(cls)) for cls in (User,Source,Record,Run)}
+def seed_accounting(rng):
+    if db_has_terminals():return
+    class SeedUser:email='analyst@'+CONFIG['slug']+'.demo'
+    user=SeedUser();base=datetime(2026,11,18,1,0,tzinfo=timezone.utc);specs=[('WP-T01','展馆 A 入口',[1,2,3]),('WP-T02','展馆 B 入口',[1,2,3])]
+    with Session() as db:
+        terminals=[create_terminal(db,user,TerminalInput(code=code,venue=venue,declared_slots=slots)) for code,venue,slots in specs]
+        rows={};withheld={}
+        exhibits=[f'E{i:02}' for i in range(1,7)]
+        for t,(_,venue,slots) in zip(terminals,specs):
+            batch=[];idx=0
+            for slot in slots:
+                for step in range(8):
+                    idx+=1;at=base+timedelta(minutes=(slot-1)*90+step*7)
+                    visitor=f'V{slot}{(step%4)+1:02}';exhibit=exhibits[(step+slot)%len(exhibits)]
+                    batch.append({'uid':f'{t["code"]}-{slot}-E{idx:03}','kind':'exposure','venue':venue,'visitor':visitor,'exhibit':exhibit,'at':at,'slot':slot})
+                    if step%3!=2:batch.append({'uid':f'{t["code"]}-{slot}-R{idx:03}','kind':'rating','venue':venue,'visitor':visitor,'exhibit':exhibit,'at':at+timedelta(minutes=3),'slot':slot,'rating':round(rng.uniform(2,5),1)})
+            rng.shuffle(batch);rows[t['id']]=batch
+            # One exposure per slot is stuck offline and only arrives after the first close.
+            withheld[t['id']]=[r for r in batch if r['kind']=='exposure' and r['at'].minute%7==0][:3]
+        for t in terminals:
+            skipped={r['uid'] for r in withheld[t['id']]}
+            add_events(db,user,t['id'],EventBatch(events=[_event(r) for r in rows[t['id']] if r['uid'] not in skipped]))
+        close_books(db,user)
+        # The late exposures make version 1's pending ratings match, and extra
+        # walked-in records open version 2 without recounting anything.
+        for t in terminals:
+            extra=[dict(r,uid=r['uid']+'-S',at=r['at']+timedelta(minutes=1)) for r in withheld[t['id']]]
+            add_events(db,user,t['id'],EventBatch(events=[_event(r) for r in withheld[t['id']]+extra]))
+        close_books(db,user)
+
+def _event(r):
+    return EventInput(record_uid=r['uid'],kind=r['kind'],visitor=r['visitor'],exhibit=r['exhibit'],occurred_at=r['at'].isoformat(),slot=r['slot'],rating=r.get('rating'),venue=r['venue'])
+
+def db_has_terminals():
+    from src.models.accounting import Terminal
+    with Session() as db:return bool(db.scalar(select(Terminal.id)))
 def seed():
     Base.metadata.create_all(engine);rng=random.Random(42);queued=[]
     with Session() as db:
@@ -53,6 +93,8 @@ def seed():
                 records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
                 run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)
         db.commit();print(json.dumps(counts(db),ensure_ascii=False))
+    try:seed_accounting(random.Random(7))
+    except Exception:logging.exception('accounting seed failed; service remains available')
     for id in queued:
         try:queue.rpush('analysis:queue',id)
         except Exception:logging.exception('seed queue unavailable')
